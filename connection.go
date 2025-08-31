@@ -134,7 +134,7 @@ func (node *P2PNode) handleConnection(conn net.Conn) {
 
 		// Update last seen time
 		node.mu.Lock()
-		if p, exists := node.Peers[peerID]; exists {
+		if p, exists := node.Peers[actualPeerID]; exists {
 			p.LastSeen = time.Now()
 		}
 		node.mu.Unlock()
@@ -144,6 +144,13 @@ func (node *P2PNode) handleConnection(conn net.Conn) {
 				"from": peerName,
 			})
 			fmt.Fprintf(conn, "PONG\n")
+			continue
+		}
+
+		if message == "PONG" {
+			node.sendDebugMessage(MsgDebugPong, map[string]interface{}{
+				"from": peerName,
+			})
 			continue
 		}
 
@@ -289,6 +296,14 @@ func (node *P2PNode) ConnectToPeer(address string) error {
 				p.LastSeen = time.Now()
 			}
 			node.mu.Unlock()
+
+			if message == "PING" {
+				node.sendDebugMessage(MsgDebugPing, map[string]interface{}{
+					"from": peerName,
+				})
+				fmt.Fprintf(conn, "PONG\n")
+				continue
+			}
 
 			if message == "PONG" {
 				node.sendDebugMessage(MsgDebugPong, map[string]interface{}{
