@@ -17,6 +17,7 @@ const (
 	MsgPeerDisconnected
 	MsgPeersDiscovered
 	MsgChatMessage
+    MsgBytesMessage
 	MsgBootstrapSuccess
 	MsgBootstrapFailed
 	MsgConnectionFailed
@@ -125,6 +126,46 @@ func (node *P2PNode) BroadcastMessage(message string) {
 		fmt.Fprintf(peer.Conn, "%s\n", message)
 	}
 	// Message broadcasting is silent in library mode
+}
+
+// Broadcast arbitrary bytes to all connected peers
+func (node *P2PNode) BroadcastBytes(data []byte) {
+	node.mu.RLock()
+	defer node.mu.RUnlock()
+
+	if len(node.Peers) == 0 {
+		return
+	}
+
+	// Protocol: "BYTES:<length>\n<data>"
+	header := fmt.Sprintf("BYTES:%d\n", len(data))
+
+	for _, peer := range node.Peers {
+		peer.Conn.Write([]byte(header))
+		peer.Conn.Write(data)
+	}
+}
+
+// Send bytes to a specific peer
+func (node *P2PNode) SendBytesToPeer(peerID string, data []byte) error {
+	node.mu.RLock()
+	peer, exists := node.Peers[peerID]
+	node.mu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("peer %s not found", peerID)
+	}
+
+	// Protocol: "BYTES:<length>\n<data>"
+	header := fmt.Sprintf("BYTES:%d\n", len(data))
+
+	_, err := peer.Conn.Write([]byte(header))
+	if err != nil {
+		return err
+	}
+
+	_, err = peer.Conn.Write(data)
+	return err
 }
 
 // GetPeerInfo returns peer information for UI display

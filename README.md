@@ -2,18 +2,34 @@
 
 A simple, modular peer-to-peer message networking library written in Go.
 
+## ⚠️ Important Security Notice
+
+**This is a proof of concept implementation and should NOT be used in production environments.**
+
+- **No encryption** - All data is sent in plaintext over TCP connections
+- **No authentication** - Anyone can connect and impersonate peers
+- **No data integrity checks** - File transfers may be corrupted without detection
+- **No access control** - Any peer can send files to any other peer
+
+This library is intended for educational purposes, local development, and trusted network environments only.
+
 ## Features
 
 - **Full mesh network** - All peers connect to all other peers
-- **Immediate peer discovery** - No waiting for periodic timers
-- **Professional logging** - Clean, timestamped output with categories
+- **Immediate peer discovery on connection** - No waiting for periodic timers
 - **Modular design** - Library can be embedded in other applications
-- **Thread-safe** - Uses proper mutex locking
-- **Configurable timeouts** - All intervals can be customized
+- **Event driven architecture** - Message channel for handling events
+- **File sharing** - Send arbitrary binary data and files between peers
 
 ## Quick Start
 
+The `main.go` file provides a simple CLI interface for testing and demonstration that includes both chat and file sharing capabilities. This can be adapted to other use cases by implementing custom message parsing and handling logic.
+
+The library supports sending arbitrary binary data using the `MsgBytesMessage` system. The CLI demo uses this for file sharing with chunked transfers and progress tracking.
+
 ### Basic Usage
+
+In the future, we might use DHT or other discovery methods, but for now, you need to manually connect nodes.
 
 ```bash
 # Start first node
@@ -21,6 +37,9 @@ go run . 8001
 
 # Start second node that connects to first
 go run . 8002 localhost:8001
+
+# Send a file from first node
+# In first terminal: /send test.txt
 
 # Start third node that connects to second
 go run . 8003 localhost:8002
@@ -61,6 +80,9 @@ func main() {
                 fmt.Printf("New peer: %s\n", msg.Data["peerID"])
             case MsgChatMessage:
                 fmt.Printf("[%s]: %s\n", msg.Data["from"], msg.Data["message"])
+            case MsgBytesMessage:
+                data := msg.Data["data"].([]byte)
+                fmt.Printf("[%s] sent %d bytes\n", msg.Data["from"], len(data))
             }
         }
     }()
@@ -76,7 +98,11 @@ func main() {
     
     // Send message
     node.BroadcastMessage("Hello network!")
-    
+
+    // Send binary data
+    data := []byte("custom protocol data")
+    node.BroadcastBytes(data)
+
     // Keep running
     select {}
 }
@@ -98,6 +124,7 @@ The library communicates through a message channel with these types:
 
 ### Chat Messages
 - `MsgChatMessage` - Received chat message from peer
+- `MsgBytesMessage` - Received binary data from peer
 
 ### Maintenance Messages
 - `MsgMaintenanceCleanup` - Removed stale peer
@@ -138,6 +165,7 @@ When running the CLI interface:
 - `/peers` - Display network status
 - `/connect <ip:port>` - Establish peer connection
 - `/discover` - Request peer discovery
+- `/send <filepath>` - Send file to all peers
 - `/quit` - Shutdown node
 - `<message>` - Broadcast message to all peers
 
@@ -176,10 +204,16 @@ PEERS:<addr1>,<addr2>   # Peer list response
 <any_text>              # Broadcast message
 ```
 
+### Binary Messages
+```
+BYTES:<length>          # Binary data header
+<binary_data>           # Raw binary data
+```
+
 **Examples:**
 - `hello everyone!` - Simple chat message
 - `network status check` - Status inquiry
-- `shutting down in 5 minutes` - Notification
+- `BYTES:1024\n<file_data>` - File transfer chunk
 
 ### Connection Flow
 ```
@@ -237,6 +271,10 @@ node.MaxPeers = 20                           // Maximum concurrent connections
 [15:04:36] [NETWORK] Connected to peer charlie at localhost:8003 (2/10 peers)
 [15:04:40] [bob] network status looks good
 [15:04:42] [charlie] all systems operational
+[15:04:43] [SYSTEM] Starting file transfer: test.txt (342 bytes)
+[15:04:43] [FILE] bob is sending file: document.pdf (1024 bytes)
+[15:04:44] [FILE] Progress: document.pdf - 100.0% (1024/1024 bytes)
+[15:04:44] [FILE] Completed: document.pdf saved to downloads/document.pdf
 [15:04:45] [MAINTENANCE] Removed stale peer dave (timeout)
 ```
 

@@ -11,7 +11,7 @@ import (
 func (node *P2PNode) StartDiscoveryAndMaintenance() {
 	// Start periodic discovery
 	go node.periodicDiscovery()
-	
+
 	// Start connection maintenance
 	go node.connectionMaintenance()
 }
@@ -206,7 +206,7 @@ func (node *P2PNode) handlePeerList(peerListStr string, fromPeerID string) {
 			"fromPeer":   fromPeerID,
 			"totalKnown": len(node.KnownPeers),
 		})
-		
+
 		// Immediately try to connect to newly discovered peers
 		go node.tryConnectToKnownPeers()
 	}

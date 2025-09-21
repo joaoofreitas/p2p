@@ -16,13 +16,13 @@ func (node *P2PNode) StartServer() error {
 		return err
 	}
 	node.Listener = listener
-	
+
 	node.sendMessage(MsgSystemStart, map[string]interface{}{
 		"nodeID":   node.ID,
 		"nodeName": node.Name,
 		"port":     node.Port,
 	})
-	
+
 	go func() {
 		for node.IsRunning {
 			conn, err := listener.Accept()
@@ -38,7 +38,7 @@ func (node *P2PNode) StartServer() error {
 			go node.handleConnection(conn)
 		}
 	}()
-	
+
 	return nil
 }
 
@@ -171,6 +171,38 @@ func (node *P2PNode) handleConnection(conn net.Conn) {
 			continue
 		}
 
+		if strings.HasPrefix(message, "BYTES:") {
+			// Parse length from "BYTES:<length>"
+			lengthStr := message[6:]
+			length, err := strconv.Atoi(lengthStr)
+			if err != nil {
+				node.sendMessage(MsgError, map[string]interface{}{
+					"error": "invalid bytes length: " + err.Error(),
+					"context": "parsing bytes message",
+				})
+				continue
+			}
+
+			// Read the exact number of bytes
+			data := make([]byte, length)
+			_, err = reader.Read(data)
+			if err != nil {
+				node.sendMessage(MsgError, map[string]interface{}{
+					"error": err.Error(),
+					"context": "reading bytes data",
+				})
+				continue
+			}
+
+			node.sendMessage(MsgBytesMessage, map[string]interface{}{
+				"from":   peerName,
+				"peerID": actualPeerID,
+				"data":   data,
+				"length": length,
+			})
+			continue
+		}
+
 		node.sendMessage(MsgChatMessage, map[string]interface{}{
 			"from":    peerName,
 			"message": message,
@@ -246,7 +278,7 @@ func (node *P2PNode) ConnectToPeer(address string) error {
 	if len(parts) == 2 && parts[1] != "" {
 		peerName = parts[1]
 	}
-	
+
 	conn.SetReadDeadline(time.Time{})
 
 	// Add peer to our list
@@ -326,6 +358,38 @@ func (node *P2PNode) ConnectToPeer(address string) error {
 					"peerCount": len(strings.Split(message[6:], ",")),
 				})
 				node.handlePeerList(message[6:], actualPeerID)
+				continue
+			}
+
+			if strings.HasPrefix(message, "BYTES:") {
+				// Parse length from "BYTES:<length>"
+				lengthStr := message[6:]
+				length, err := strconv.Atoi(lengthStr)
+				if err != nil {
+					node.sendMessage(MsgError, map[string]interface{}{
+						"error": "invalid bytes length: " + err.Error(),
+						"context": "parsing bytes message",
+					})
+					continue
+				}
+
+				// Read the exact number of bytes
+				data := make([]byte, length)
+				_, err = reader.Read(data)
+				if err != nil {
+					node.sendMessage(MsgError, map[string]interface{}{
+						"error": err.Error(),
+						"context": "reading bytes data",
+					})
+					continue
+				}
+
+				node.sendMessage(MsgBytesMessage, map[string]interface{}{
+					"from":   peerName,
+					"peerID": actualPeerID,
+					"data":   data,
+					"length": length,
+				})
 				continue
 			}
 
