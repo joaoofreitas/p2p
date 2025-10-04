@@ -1,8 +1,10 @@
-package main
+// Package p2p provides a simple peer-to-peer networking library.
+package p2p
 
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -27,12 +29,13 @@ func (node *P2PNode) StartServer() error {
 		for node.IsRunning {
 			conn, err := listener.Accept()
 			if err != nil {
-				if node.IsRunning {
-					node.sendMessage(MsgError, map[string]interface{}{
-					"error": err.Error(),
+				if !node.IsRunning {
+					break
+				}
+				node.sendMessage(MsgError, map[string]interface{}{
+					"error":   err.Error(),
 					"context": "accepting connection",
 				})
-				}
 				continue
 			}
 			go node.handleConnection(conn)
@@ -52,26 +55,32 @@ func (node *P2PNode) handleConnection(conn net.Conn) {
 	reader := bufio.NewReader(conn)
 
 	// Read the handshake (peer ID)
-	peerID, err := reader.ReadString('\n')
+	line, err := reader.ReadString('\n')
 	if err != nil {
 		node.sendMessage(MsgError, map[string]interface{}{
-			"error": err.Error(),
+			"error":   err.Error(),
 			"context": "reading peer ID",
 		})
 		return
 	}
-	peerID = strings.TrimSpace(peerID)
+	line = strings.TrimSpace(line)
 
-	// Check if we already have this peer
+	// Parse peer ID and name (format: "ID:NAME")
+	parts := strings.SplitN(line, ":", 2)
+	actualPeerID := parts[0]
+	peerName := actualPeerID // default to ID if no name
+	if len(parts) == 2 && parts[1] != "" {
+		peerName = parts[1]
+	}
+
+	// Check if we already have this peer and peer limit
 	node.mu.Lock()
-	if _, exists := node.Peers[peerID]; exists {
+	if _, exists := node.Peers[actualPeerID]; exists {
 		node.mu.Unlock()
 		// Silently reject duplicate connections
 		fmt.Fprintf(conn, "DUPLICATE\n")
 		return
 	}
-
-	// Check peer limit
 	if len(node.Peers) >= node.MaxPeers {
 		node.mu.Unlock()
 		// Silently reject when max peers reached
@@ -80,41 +89,46 @@ func (node *P2PNode) handleConnection(conn net.Conn) {
 	}
 	node.mu.Unlock()
 
-	// Send our ID:NAME back
-	fmt.Fprintf(conn, "%s:%s\n", node.ID, node.Name)
-
+	// Optionally read peer listen address: LISTEN:<addr>
+	var peerListenAddr string
+	conn.SetReadDeadline(time.Now().Add(node.ConnectionTimeout))
+	if listenLine, e := reader.ReadString('\n'); e == nil {
+		l := strings.TrimSpace(listenLine)
+		if strings.HasPrefix(l, "LISTEN:") {
+			peerListenAddr = strings.TrimSpace(l[len("LISTEN:"):])
+		}
+	}
 	// Remove read timeout for ongoing communication
 	conn.SetReadDeadline(time.Time{})
 
-	// Parse peer ID and name (format: "ID:NAME")
-	parts := strings.SplitN(peerID, ":", 2)
-	actualPeerID := parts[0]
-    peerName := actualPeerID // default to ID if no name
-    if len(parts) == 2 && parts[1] != "" {
-        peerName = parts[1]
-    }
-
+	// Send our ID:NAME back
+	fmt.Fprintf(conn, "%s:%s\n", node.ID, node.Name)
 
 	// Add peer to our list
+	addr := conn.RemoteAddr().String()
+	if peerListenAddr != "" {
+		addr = peerListenAddr
+	}
 	peer := &Peer{
 		ID:       actualPeerID,
 		Name:     peerName,
-		Address:  conn.RemoteAddr().String(),
+		Address:  addr,
 		Conn:     conn,
 		LastSeen: time.Now(),
 	}
 
 	node.mu.Lock()
 	node.Peers[actualPeerID] = peer
+	peerCount := len(node.Peers)
 	node.mu.Unlock()
 
 	node.sendMessage(MsgPeerConnected, map[string]interface{}{
-		"peerID":     actualPeerID,
-		"peerName":   peerName,
-		"address":    conn.RemoteAddr().String(),
-		"peerCount":  len(node.Peers),
-		"maxPeers":   node.MaxPeers,
-		"direction":  "incoming",
+		"peerID":    actualPeerID,
+		"peerName":  peerName,
+		"address":   addr,
+		"peerCount": peerCount,
+		"maxPeers":  node.MaxPeers,
+		"direction": "incoming",
 	})
 
 	// Share our peer list immediately
@@ -177,7 +191,7 @@ func (node *P2PNode) handleConnection(conn net.Conn) {
 			length, err := strconv.Atoi(lengthStr)
 			if err != nil {
 				node.sendMessage(MsgError, map[string]interface{}{
-					"error": "invalid bytes length: " + err.Error(),
+					"error":   "invalid bytes length: " + err.Error(),
 					"context": "parsing bytes message",
 				})
 				continue
@@ -185,10 +199,10 @@ func (node *P2PNode) handleConnection(conn net.Conn) {
 
 			// Read the exact number of bytes
 			data := make([]byte, length)
-			_, err = reader.Read(data)
+			_, err = io.ReadFull(reader, data)
 			if err != nil {
 				node.sendMessage(MsgError, map[string]interface{}{
-					"error": err.Error(),
+					"error":   err.Error(),
 					"context": "reading bytes data",
 				})
 				continue
@@ -248,8 +262,9 @@ func (node *P2PNode) ConnectToPeer(address string) error {
 		return err
 	}
 
-	// Send handshake (our ID:NAME)
+	// Send handshake (our ID:NAME) and our listening address
 	fmt.Fprintf(conn, "%s:%s\n", node.ID, node.Name)
+	fmt.Fprintf(conn, "LISTEN:localhost:%d\n", node.Port)
 
 	// Read peer's response
 	conn.SetReadDeadline(time.Now().Add(node.ConnectionTimeout))
@@ -296,12 +311,12 @@ func (node *P2PNode) ConnectToPeer(address string) error {
 	node.mu.Unlock()
 
 	node.sendMessage(MsgPeerConnected, map[string]interface{}{
-		"peerID":     actualPeerID,
-		"peerName":   peerName,
-		"address":    address,
-		"peerCount":  peerCount,
-		"maxPeers":   node.MaxPeers,
-		"direction":  "outgoing",
+		"peerID":    actualPeerID,
+		"peerName":  peerName,
+		"address":   address,
+		"peerCount": peerCount,
+		"maxPeers":  node.MaxPeers,
+		"direction": "outgoing",
 	})
 
 	// Share our peer list immediately and request theirs
@@ -367,7 +382,7 @@ func (node *P2PNode) ConnectToPeer(address string) error {
 				length, err := strconv.Atoi(lengthStr)
 				if err != nil {
 					node.sendMessage(MsgError, map[string]interface{}{
-						"error": "invalid bytes length: " + err.Error(),
+						"error":   "invalid bytes length: " + err.Error(),
 						"context": "parsing bytes message",
 					})
 					continue
@@ -375,10 +390,10 @@ func (node *P2PNode) ConnectToPeer(address string) error {
 
 				// Read the exact number of bytes
 				data := make([]byte, length)
-				_, err = reader.Read(data)
+				_, err = io.ReadFull(reader, data)
 				if err != nil {
 					node.sendMessage(MsgError, map[string]interface{}{
-						"error": err.Error(),
+						"error":   err.Error(),
 						"context": "reading bytes data",
 					})
 					continue

@@ -1,12 +1,12 @@
-package main
+package p2p
 
 import (
+	"crypto/rand"
 	"fmt"
 	"net"
 	"strings"
 	"sync"
 	"time"
-    "math/rand"
 )
 
 type MessageType int
@@ -17,7 +17,7 @@ const (
 	MsgPeerDisconnected
 	MsgPeersDiscovered
 	MsgChatMessage
-    MsgBytesMessage
+	MsgBytesMessage
 	MsgBootstrapSuccess
 	MsgBootstrapFailed
 	MsgConnectionFailed
@@ -44,7 +44,7 @@ type Peer struct {
 
 type P2PNode struct {
 	ID            string
-	Name          string               // Custom peer name (defaults to peer-<port>)
+	Name          string // Custom peer name (defaults to peer-<port>)
 	Port          int
 	Peers         map[string]*Peer
 	KnownPeers    map[string]time.Time // Discovered but not necessarily connected peers
@@ -54,35 +54,46 @@ type P2PNode struct {
 	BootstrapPort int
 	MaxPeers      int
 	IsRunning     bool
-	Messages      chan P2PMessage      // Channel for UI messages
-	DebugMode     bool                 // Enable verbose debug output
+	Messages      chan P2PMessage // Channel for UI messages
+	DebugMode     bool            // Enable verbose debug output
 
 	// Configurable timeouts
-	DiscoveryInterval time.Duration
+	DiscoveryInterval   time.Duration
 	MaintenanceInterval time.Duration
-	ConnectionTimeout time.Duration
-	PeerTimeout time.Duration
+	ConnectionTimeout   time.Duration
+	PeerTimeout         time.Duration
+
+	// Maximum allowed size for BYTES payloads; 0 means unlimited
+	MaxBytesPerMessage int
 }
 
 func NewP2PNode(port int, bootstrapIP string, bootstrapPort int, name string) *P2PNode {
-    // Create random uuid for the node
-    id := fmt.Sprintf("%x-%x-%x-%x-%x", rand.Int31(), rand.Int31(), rand.Int31(), rand.Int31(), rand.Int31())
-    if name == "" {
-        name = id
-    }
+	// Create random ID for the node using crypto/rand
+	var id string
+	var randBytes [16]byte
+	if _, err := rand.Read(randBytes[:]); err != nil {
+		// Fallback to time-based ID if crypto/rand fails
+		id = fmt.Sprintf("node-%d", time.Now().UnixNano())
+	} else {
+		id = fmt.Sprintf("%x", randBytes)
+	}
+	if name == "" {
+		name = id
+	}
 
 	return &P2PNode{
-		ID:            id,
-		Name:          name,               // Display name
-		Port:          port,
-		Peers:         make(map[string]*Peer),
-		KnownPeers:    make(map[string]time.Time),
-		BootstrapIP:   bootstrapIP,
-		BootstrapPort: bootstrapPort,
-		MaxPeers:      10,
-		IsRunning:     true,
-		Messages:      make(chan P2PMessage, 100), // Buffered channel
-		DebugMode:     false,
+		ID:                 id,
+		Name:               name, // Display name
+		Port:               port,
+		Peers:              make(map[string]*Peer),
+		KnownPeers:         make(map[string]time.Time),
+		BootstrapIP:        bootstrapIP,
+		BootstrapPort:      bootstrapPort,
+		MaxPeers:           10,
+		IsRunning:          true,
+		Messages:           make(chan P2PMessage, 100), // Buffered channel
+		DebugMode:          false,
+		MaxBytesPerMessage: 16 * 1024 * 1024,
 
 		// Default timeouts
 		DiscoveryInterval:   30 * time.Second,
@@ -116,33 +127,53 @@ func (node *P2PNode) isMyAddress(address string) bool {
 // Broadcast message to all connected peers
 func (node *P2PNode) BroadcastMessage(message string) {
 	node.mu.RLock()
-	defer node.mu.RUnlock()
-
 	if len(node.Peers) == 0 {
+		node.mu.RUnlock()
 		return
 	}
+	peers := make([]net.Conn, 0, len(node.Peers))
+	for _, p := range node.Peers {
+		if p.Conn != nil {
+			peers = append(peers, p.Conn)
+		}
+	}
+	node.mu.RUnlock()
 
-	for _, peer := range node.Peers {
-		fmt.Fprintf(peer.Conn, "%s\n", message)
+	for _, c := range peers {
+		fmt.Fprintf(c, "%s\n", message)
 	}
 	// Message broadcasting is silent in library mode
 }
 
 // Broadcast arbitrary bytes to all connected peers
 func (node *P2PNode) BroadcastBytes(data []byte) {
-	node.mu.RLock()
-	defer node.mu.RUnlock()
-
-	if len(node.Peers) == 0 {
+	if node.MaxBytesPerMessage > 0 && len(data) > node.MaxBytesPerMessage {
+		node.sendMessage(MsgError, map[string]interface{}{
+			"error":   fmt.Sprintf("payload too large: %d > %d", len(data), node.MaxBytesPerMessage),
+			"context": "broadcast bytes",
+		})
 		return
 	}
+
+	node.mu.RLock()
+	if len(node.Peers) == 0 {
+		node.mu.RUnlock()
+		return
+	}
+	peers := make([]net.Conn, 0, len(node.Peers))
+	for _, p := range node.Peers {
+		if p.Conn != nil {
+			peers = append(peers, p.Conn)
+		}
+	}
+	node.mu.RUnlock()
 
 	// Protocol: "BYTES:<length>\n<data>"
 	header := fmt.Sprintf("BYTES:%d\n", len(data))
 
-	for _, peer := range node.Peers {
-		peer.Conn.Write([]byte(header))
-		peer.Conn.Write(data)
+	for _, c := range peers {
+		c.Write([]byte(header))
+		c.Write(data)
 	}
 }
 
@@ -169,14 +200,14 @@ func (node *P2PNode) SendBytesToPeer(peerID string, data []byte) error {
 }
 
 // GetPeerInfo returns peer information for UI display
-func (node *P2PNode) GetPeerInfo() (connected map[string]*Peer, known map[string]time.Time, maxPeers int) {
+func (node *P2PNode) GetPeerInfo() (connected map[string]Peer, known map[string]time.Time, maxPeers int) {
 	node.mu.RLock()
 	defer node.mu.RUnlock()
 
 	// Create copies to avoid race conditions
-	connectedCopy := make(map[string]*Peer)
+	connectedCopy := make(map[string]Peer)
 	for id, peer := range node.Peers {
-		connectedCopy[id] = peer
+		connectedCopy[id] = *peer
 	}
 
 	knownCopy := make(map[string]time.Time)

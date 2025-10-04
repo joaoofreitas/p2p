@@ -23,9 +23,9 @@ This library is intended for educational purposes, local development, and truste
 
 ## Quick Start
 
-The `main.go` file provides a simple CLI interface for testing and demonstration that includes both chat and file sharing capabilities. This can be adapted to other use cases by implementing custom message parsing and handling logic.
+The `cmd/p2p/main.go` file provides a simple CLI interface for testing and demonstration that includes both chat and file sharing capabilities. This can be adapted to other use cases by implementing custom message parsing and handling logic.
 
-The library supports sending arbitrary binary data using the `MsgBytesMessage` system. The CLI demo uses this for file sharing with chunked transfers and progress tracking.
+The library exposes a generic BYTES channel via `MsgBytesMessage` for arbitrary binary protocols (HTTP-like, FTP-like, or fully custom). The CLI demonstrates one such protocol by implementing a simple file transfer on top of BYTES.
 
 ### Basic Usage
 
@@ -33,27 +33,27 @@ In the future, we might use DHT or other discovery methods, but for now, you nee
 
 ```bash
 # Start first node
-go run . 8001
+go run ./cmd/p2p 8001
 
 # Start second node that connects to first
-go run . 8002 localhost:8001
+go run ./cmd/p2p 8002 localhost:8001
 
-# Send a file from first node
+Send a file from first node
 # In first terminal: /send test.txt
 
 # Start third node that connects to second
-go run . 8003 localhost:8002
+go run ./cmd/p2p 8003 localhost:8002
 ```
 
 ### With Custom Name
 ```bash
-go run . 8001 --name alice
-go run . 8002 localhost:8001 --name bob
+go run ./cmd/p2p 8001 --name alice
+go run ./cmd/p2p 8002 localhost:8001 --name bob
 ```
 
 ### Debug Mode
 ```bash
-go run . 8001 --debug  # Shows ping/pong messages and verbose output
+go run ./cmd/p2p 8001 --debug  # Shows ping/pong messages and verbose output
 ```
 
 ## Library Usage
@@ -66,42 +66,59 @@ package main
 import (
     "fmt"
     "time"
+
+    "github.com/joaoofreitas/p2p"
 )
 
 func main() {
     // Create node
-    node := NewP2PNode(8001, "", 0)
-    
+    node := p2p.NewP2PNode(8001, "", 0, "")
+
+    // Optional: limit BYTES payload size (default 16 MiB)
+    node.MaxBytesPerMessage = 16 * 1024 * 1024
+
+    // File transfer receiver (saves to ./downloads)
+    r := p2p.NewFileTransferReceiver("downloads")
+    r.OnStart = func(info p2p.StartInfo) {
+        fmt.Printf("[FILE] %s is sending %s (%d bytes)\n", info.From, info.FileName, info.Size)
+    }
+    r.OnProgress = func(info p2p.ProgressInfo) {
+        fmt.Printf("[FILE] %s progress: %.1f%%\n", info.FileName, info.Percent)
+    }
+    r.OnComplete = func(info p2p.CompleteInfo) {
+        fmt.Printf("[FILE] complete: %s -> %s\n", info.FileName, info.Path)
+    }
+
     // Handle messages
     go func() {
         for msg := range node.Messages {
             switch msg.Type {
-            case MsgPeerConnected:
+            case p2p.MsgPeerConnected:
                 fmt.Printf("New peer: %s\n", msg.Data["peerID"])
-            case MsgChatMessage:
+            case p2p.MsgChatMessage:
                 fmt.Printf("[%s]: %s\n", msg.Data["from"], msg.Data["message"])
-            case MsgBytesMessage:
+            case p2p.MsgBytesMessage:
                 data := msg.Data["data"].([]byte)
-                fmt.Printf("[%s] sent %d bytes\n", msg.Data["from"], len(data))
+                from := msg.Data["from"].(string)
+                _ = r.HandleBytes(from, data)
             }
         }
     }()
-    
+
     // Start server
-    node.StartServer()
+    _ = node.StartServer()
     node.StartDiscoveryAndMaintenance()
-    
+
     // Connect to bootstrap peer
     if err := node.ConnectToPeer("localhost:8000"); err != nil {
         fmt.Printf("Bootstrap failed: %v\n", err)
     }
-    
+
     // Send message
     node.BroadcastMessage("Hello network!")
 
-    // Send binary data
-    data := []byte("custom protocol data")
-    node.BroadcastBytes(data)
+    // Send binary data using your custom protocol
+    node.BroadcastBytes([]byte("custom protocol data"))
 
     // Keep running
     select {}
@@ -117,7 +134,7 @@ The library communicates through a message channel with these types:
 - `MsgError` - Error occurred
 - `MsgBootstrapSuccess/Failed` - Bootstrap attempt results
 
-### Network Messages  
+### Network Messages
 - `MsgPeerConnected` - New peer joined network
 - `MsgPeerDisconnected` - Peer left network
 - `MsgPeersDiscovered` - Found new peers through discovery
@@ -142,10 +159,11 @@ type P2PMessage struct {
 ## Architecture
 
 ### File Structure
-- `main.go` - CLI interface and message formatting
-- `node.go` - Core P2PNode struct and configuration  
+- `cmd/p2p/main.go` - CLI interface and message formatting
+- `node.go` - Core P2PNode struct and configuration
 - `connection.go` - Connection handling and peer management
 - `discovery.go` - Peer discovery and network maintenance
+
 
 ### Network Topology
 
@@ -169,17 +187,8 @@ When running the CLI interface:
 - `/quit` - Shutdown node
 - `<message>` - Broadcast message to all peers
 
-## Network Protocol Commands
+### Handshake Example
 
-These are the actual commands sent over TCP connections between peers:
-
-### Handshake Protocol
-```
-Client -> Server: ID:NAME
-Server -> Client: ID:NAME or DUPLICATE or MAX_PEERS
-```
-
-**Examples:**
 - `peer-8001:alice` - Peer with ID "peer-8001" and name "alice"
 - `peer-8002:peer-8002` - Peer with no custom name (defaults to ID)
 - `DUPLICATE` - Server rejects connection (already connected)
@@ -209,12 +218,6 @@ PEERS:<addr1>,<addr2>   # Peer list response
 BYTES:<length>          # Binary data header
 <binary_data>           # Raw binary data
 ```
-
-**Examples:**
-- `hello everyone!` - Simple chat message
-- `network status check` - Status inquiry
-- `BYTES:1024\n<file_data>` - File transfer chunk
-
 ### Connection Flow
 ```
 1. TCP Connect to peer
@@ -231,12 +234,13 @@ BYTES:<length>          # Binary data header
 ### Timeouts (configurable in NewP2PNode):
 
 ```go
-node := NewP2PNode(8001, "bootstrap.example.com", 8000)
+node := NewP2PNode(8001, "bootstrap.example.com", 8000, "")
 node.DiscoveryInterval = 30 * time.Second    // Peer discovery frequency
 node.MaintenanceInterval = 15 * time.Second  // Connection cleanup frequency
 node.ConnectionTimeout = 10 * time.Second    // TCP connection timeout
 node.PeerTimeout = 60 * time.Second          // Consider peer dead after
 node.MaxPeers = 20                           // Maximum concurrent connections
+node.MaxBytesPerMessage = 16 * 1024 * 1024   // Limit BYTES payloads (optional)
 ```
 
 ## Limitations
@@ -261,6 +265,34 @@ node.MaxPeers = 20                           // Maximum concurrent connections
 - Not suitable for public networks like BitTorrent
 - Not Byzantine fault tolerant
 - No built-in encryption/authentication
+
+## Example: File Transfer over BYTES (CLI)
+
+The library transports raw bytes via `MsgBytesMessage`. The CLI demonstrates a minimal custom file transfer protocol using a single-frame format:
+
+FILE:FILE_METADATA:FILEBYTES:CHECKSUM
+
+- FILE_METADATA: "<filename>|<size>"
+- FILEBYTES: base64-encoded raw file bytes
+- CHECKSUM: hex-encoded SHA-256 of the raw file bytes
+
+High-level flow:
+- Sender: reads the file into memory, computes checksum, builds the frame, and sends via `BroadcastBytes`.
+- Receiver: validates the frame shape, decodes base64, verifies SHA-256, optionally checks the size, then writes to `downloads/` using a non-overwriting filename.
+
+On the wire (conceptually):
+```
+BYTES:<len>\nFILE:document.pdf|1024:<base64...>:<hex_sha256>
+```
+
+CLI usage:
+- `/send <filepath>` broadcasts a file to all connected peers.
+- Receivers validate and save files under `downloads/`.
+
+Build your own protocols:
+- Define your own framing and semantics (e.g., token-delimited strings, JSON, protobuf, msgpack).
+- Serialize to bytes and send using `BroadcastBytes` or `SendBytesToPeer`.
+- In your application, handle `MsgBytesMessage` to parse incoming payloads and implement your logic.
 
 ## Example Output
 

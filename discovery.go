@@ -1,4 +1,5 @@
-package main
+// Package p2p provides a simple peer-to-peer networking library.
+package p2p
 
 import (
 	"fmt"
@@ -36,18 +37,21 @@ func (node *P2PNode) periodicDiscovery() {
 // Request peer lists from connected peers
 func (node *P2PNode) requestPeerLists() {
 	node.mu.RLock()
-	defer node.mu.RUnlock()
-
-	for _, peer := range node.Peers {
-		if peer.Conn != nil {
-			fmt.Fprintf(peer.Conn, "REQUEST_PEERS\n")
+	peers := make([]*Peer, 0, len(node.Peers))
+	for _, p := range node.Peers {
+		if p.Conn != nil {
+			peers = append(peers, p)
 		}
+	}
+	node.mu.RUnlock()
+
+	for _, peer := range peers {
+		fmt.Fprintf(peer.Conn, "REQUEST_PEERS\n")
 	}
 }
 
 // Try to connect to known but unconnected peers
 func (node *P2PNode) tryConnectToKnownPeers() {
-	node.mu.RLock()
 	node.mu.RLock()
 
 	// Find unconnected known peers
@@ -71,7 +75,6 @@ func (node *P2PNode) tryConnectToKnownPeers() {
 		}
 	}
 
-	node.mu.RUnlock()
 	node.mu.RUnlock()
 
 	// Try to connect to a few random candidates
@@ -114,18 +117,22 @@ func (node *P2PNode) connectionMaintenance() {
 	}
 }
 
-// Ping all connected peers
+// Ping all connected s
 func (node *P2PNode) pingPeers() {
 	node.mu.RLock()
-	defer node.mu.RUnlock()
-
-	for _, peer := range node.Peers {
-		if peer.Conn != nil {
-			node.sendDebugMessage(MsgDebugPing, map[string]interface{}{
-				"to": peer.Name,
-			})
-			fmt.Fprintf(peer.Conn, "PING\n")
+	peers := make([]*Peer, 0, len(node.Peers))
+	for _, p := range node.Peers {
+		if p.Conn != nil {
+			peers = append(peers, p)
 		}
+	}
+	node.mu.RUnlock()
+
+	for _, peer := range peers {
+		node.sendDebugMessage(MsgDebugPing, map[string]interface{}{
+			"to": peer.Name,
+		})
+		fmt.Fprintf(peer.Conn, "PING\n")
 	}
 }
 
@@ -170,7 +177,7 @@ func (node *P2PNode) Bootstrap() {
 		}
 
 		node.sendMessage(MsgBootstrapFailed, map[string]interface{}{
-			"address": address,
+			"address":  address,
 			"attempts": 5,
 		})
 	}
@@ -188,7 +195,7 @@ func (node *P2PNode) handlePeerList(peerListStr string, fromPeerID string) {
 	node.mu.Lock()
 	for _, address := range addresses {
 		address = strings.TrimSpace(address)
-		if address == "" || node.isMyAddress(address) {
+		if address == "" || node.isMyAddress(address) || strings.Contains(address, "[::1]:") {
 			continue
 		}
 
@@ -215,13 +222,12 @@ func (node *P2PNode) handlePeerList(peerListStr string, fromPeerID string) {
 // Share our peer list and known peers
 func (node *P2PNode) sharePeerList(targetPeer *Peer) {
 	node.mu.RLock()
-	node.mu.RLock()
 
 	var addresses []string
 
 	// Add connected peers
 	for _, peer := range node.Peers {
-		if peer.ID != targetPeer.ID && peer.Conn != nil {
+		if peer.ID != targetPeer.ID && peer.Conn != nil && !strings.Contains(peer.Address, "[::1]:") {
 			addresses = append(addresses, peer.Address)
 		}
 	}
@@ -232,7 +238,7 @@ func (node *P2PNode) sharePeerList(targetPeer *Peer) {
 		if count >= 5 { // Limit to avoid huge messages
 			break
 		}
-		if !node.isMyAddress(address) {
+		if !node.isMyAddress(address) && !strings.Contains(address, "[::1]:") {
 			// Check if already in the list
 			found := false
 			for _, addr := range addresses {
@@ -248,7 +254,6 @@ func (node *P2PNode) sharePeerList(targetPeer *Peer) {
 		}
 	}
 
-	node.mu.RUnlock()
 	node.mu.RUnlock()
 
 	if len(addresses) > 0 {

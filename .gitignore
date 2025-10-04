@@ -30,3 +30,8 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+# Project build artifacts and outputs
+/p2p
+cmd/p2p/p2p
+downloads/
+*.log
