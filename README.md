@@ -25,7 +25,7 @@ This library is intended for educational purposes, local development, and truste
 
 The `cmd/p2p/main.go` file provides a simple CLI interface for testing and demonstration that includes both chat and file sharing capabilities. This can be adapted to other use cases by implementing custom message parsing and handling logic.
 
-The library exposes a generic BYTES channel via `MsgBytesMessage` for arbitrary binary protocols (HTTP-like, FTP-like, or fully custom). The CLI demonstrates one such protocol by implementing a simple file transfer on top of BYTES.
+The library exposes a generic BYTES channel via `MsgBytesMessage` for arbitrary binary protocols (HTTP-like, FTP-like, or fully custom). The CLI demonstrates one such protocol by implementing a simple chunked file transfer on top of BYTES.
 
 ### Basic Usage
 
@@ -47,13 +47,13 @@ go run ./cmd/p2p 8003 localhost:8002
 
 ### With Custom Name
 ```bash
-go run ./cmd/p2p 8001 --name alice
-go run ./cmd/p2p 8002 localhost:8001 --name bob
+go run ./cmd/p2p --name alice 8001
+go run ./cmd/p2p --name bob 8002 localhost:8001
 ```
 
 ### Debug Mode
 ```bash
-go run ./cmd/p2p 8001 --debug  # Shows ping/pong messages and verbose output
+go run ./cmd/p2p --debug 8001  # Shows ping/pong messages and verbose output
 ```
 
 ## Library Usage
@@ -77,17 +77,17 @@ func main() {
     // Optional: limit BYTES payload size (default 16 MiB)
     node.MaxBytesPerMessage = 16 * 1024 * 1024
 
-    // File transfer receiver (saves to ./downloads)
-    r := p2p.NewFileTransferReceiver("downloads")
-    r.OnStart = func(info p2p.StartInfo) {
-        fmt.Printf("[FILE] %s is sending %s (%d bytes)\n", info.From, info.FileName, info.Size)
-    }
-    r.OnProgress = func(info p2p.ProgressInfo) {
-        fmt.Printf("[FILE] %s progress: %.1f%%\n", info.FileName, info.Percent)
-    }
-    r.OnComplete = func(info p2p.CompleteInfo) {
-        fmt.Printf("[FILE] complete: %s -> %s\n", info.FileName, info.Path)
-    }
+    // BYTES handling: implement your own protocol in MsgBytesMessage case below.
+    // For example, you can stream chunked file data, RPC frames, etc.
+    // This README no longer uses a built-in file receiver in the library.
+    // See cmd/p2p/main.go for a complete chunked file transfer example.
+    //
+    // The library only transports bytes; parsing is up to your application.
+    //
+    // Tip: keep messages small or chunk large payloads for reliability.
+    //
+    // Downloads or persistence are application responsibilities.
+    //
 
     // Handle messages
     go func() {
@@ -100,8 +100,9 @@ func main() {
             case p2p.MsgBytesMessage:
                 data := msg.Data["data"].([]byte)
                 from := msg.Data["from"].(string)
-                _ = r.HandleBytes(from, data)
+                fmt.Printf("[BYTES] from %s (%d bytes)\n", from, len(data))
             }
+            // Parse your custom protocol here
         }
     }()
 
@@ -268,26 +269,27 @@ node.MaxBytesPerMessage = 16 * 1024 * 1024   // Limit BYTES payloads (optional)
 
 ## Example: File Transfer over BYTES (CLI)
 
-The library transports raw bytes via `MsgBytesMessage`. The CLI demonstrates a minimal custom file transfer protocol using a single-frame format:
+The library transports raw bytes via `MsgBytesMessage`. The CLI demonstrates a minimal chunked file transfer protocol composed of three frame types:
 
-FILE:FILE_METADATA:FILEBYTES:CHECKSUM
+FILESTART:<filename>|<size>|<checksum>
 
-- FILE_METADATA: "<filename>|<size>"
-- FILEBYTES: base64-encoded raw file bytes
-- CHECKSUM: hex-encoded SHA-256 of the raw file bytes
+<raw file bytes>
+FILEEND:<filename>|<checksum>
+```
 
+- size: total byte length of the file
+- chunks: sent as separate BYTES frames; each `FILECHUNK` header line is followed by raw bytes
 High-level flow:
-- Sender: reads the file into memory, computes checksum, builds the frame, and sends via `BroadcastBytes`.
-- Receiver: validates the frame shape, decodes base64, verifies SHA-256, optionally checks the size, then writes to `downloads/` using a non-overwriting filename.
 
+- Receiver: opens downloads/<name>.part, appends chunk bytes, updates a running SHA-256, verifies size and checksum at `FILEEND`, and renames to the final path with non-overwriting semantics.
 On the wire (conceptually):
 ```
-BYTES:<len>\nFILE:document.pdf|1024:<base64...>:<hex_sha256>
-```
+BYTES:<len>\nFILESTART:document.pdf|1024|<hex_sha256>
 
+BYTES:<len>\nFILEEND:document.pdf|<hex_sha256>
+```
 CLI usage:
 - `/send <filepath>` broadcasts a file to all connected peers.
-- Receivers validate and save files under `downloads/`.
 
 Build your own protocols:
 - Define your own framing and semantics (e.g., token-delimited strings, JSON, protobuf, msgpack).
@@ -304,9 +306,9 @@ Build your own protocols:
 [15:04:40] [bob] network status looks good
 [15:04:42] [charlie] all systems operational
 [15:04:43] [SYSTEM] Starting file transfer: test.txt (342 bytes)
-[15:04:43] [FILE] bob is sending file: document.pdf (1024 bytes)
-[15:04:44] [FILE] Progress: document.pdf - 100.0% (1024/1024 bytes)
-[15:04:44] [FILE] Completed: document.pdf saved to downloads/document.pdf
+[15:04:43] [FILE] bob is sending document.pdf (1024 bytes)
+[15:04:44] [FILE] document.pdf progress: 100.0% (1024/1024 bytes)
+[15:04:44] [FILE] bob sent file: document.pdf (1024 bytes) -> downloads/document.pdf
 [15:04:45] [MAINTENANCE] Removed stale peer dave (timeout)
 ```
 

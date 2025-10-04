@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"hash"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -15,100 +17,250 @@ import (
 	"github.com/joaoofreitas/p2p"
 )
 
-// Simple custom BYTES-based file protocol frame:
-// FILE:<filename>|<size>|<checksum>\n<raw file bytes>
+// Chunked BYTES-based file protocol frames:
+// FILESTART:<filename>|<size>|<checksum>\n
+// FILECHUNK:<filename>\n<raw file bytes>
+// FILEEND:<filename>|<checksum>\n
 // - <checksum>: hex-encoded SHA-256 of raw file bytes
-const fileFramePrefix = "FILE:"
+const (
+	fileStartPrefix = "FILESTART:"
+	fileChunkPrefix = "FILECHUNK:"
+	fileEndPrefix   = "FILEEND:"
+)
 
-// sendFile reads the file, frames it into the custom BYTES protocol, and broadcasts it.
+const defaultChunkSize = 256 * 1024 // 256 KiB
+
+type incomingFile struct {
+	fileName         string
+	tmpPath          string
+	finalPath        string
+	f                *os.File
+	hasher           hash.Hash
+	expectedSize     int64
+	expectedChecksum string
+	received         int64
+}
+
+var recvFiles = make(map[string]*incomingFile)
+
+// sendFile streams the file in chunks using the custom BYTES protocol.
 func sendFile(node *p2p.P2PNode, filePath string) error {
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		return fmt.Errorf("cannot read file: %w", err)
-	}
 	fileName := filepath.Base(filePath)
-	size := len(data)
 
-	sum := sha256.Sum256(data)
-	checksum := hex.EncodeToString(sum[:])
-	header := fmt.Sprintf("FILE:%s|%d|%s\n", fileName, size, checksum)
-	payload := append([]byte(header), data...)
+	st, err := os.Stat(filePath)
+	if err != nil {
+		return fmt.Errorf("cannot stat file: %w", err)
+	}
+	size := st.Size()
 
+	// Compute checksum with a streaming pass
+	f, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("cannot open file for hashing: %w", err)
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		f.Close()
+		return fmt.Errorf("cannot hash file: %w", err)
+	}
+	f.Close()
+	checksum := hex.EncodeToString(h.Sum(nil))
+
+	// Announce transfer
+	startHeader := fmt.Sprintf("%s%s|%d|%s\n", fileStartPrefix, fileName, size, checksum)
 	fmt.Printf("[SYSTEM] Starting file transfer: %s (%d bytes)\n", fileName, size)
-	node.BroadcastBytes(payload)
+	node.BroadcastBytes([]byte(startHeader))
+
+	// Stream chunks
+	f2, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("cannot open file for sending: %w", err)
+	}
+	defer f2.Close()
+
+	buf := make([]byte, defaultChunkSize)
+	var sent int64
+
+	for {
+		n, rerr := f2.Read(buf)
+		if n > 0 {
+			chunkHeader := fmt.Sprintf("%s%s\n", fileChunkPrefix, fileName)
+			payload := append([]byte(chunkHeader), buf[:n]...)
+			node.BroadcastBytes(payload)
+
+			sent += int64(n)
+			if size > 0 {
+				percent := float64(sent) * 100.0 / float64(size)
+				fmt.Printf("[SYSTEM] Sending %s: %.1f%% (%d/%d bytes)\n", fileName, percent, sent, size)
+			}
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return fmt.Errorf("read error: %w", rerr)
+		}
+	}
+
+	// Signal completion (include checksum for redundancy)
+	endHeader := fmt.Sprintf("%s%s|%s\n", fileEndPrefix, fileName, checksum)
+	node.BroadcastBytes([]byte(endHeader))
 	fmt.Printf("[SYSTEM] File transfer completed: %s\n", fileName)
 	return nil
 }
 
-// handleIncomingBytes parses incoming BYTES according to the custom protocol.
-// If it's not a file frame, it logs a generic binary message.
-func handleIncomingBytes(from string, data []byte, timestamp string) {
+// handleIncomingBytes parses incoming BYTES according to the chunked protocol
+// and streams file data to disk with checksum verification.
+func handleIncomingBytes(peerID, from string, data []byte, timestamp string) {
 	msg := string(data)
-	if !strings.HasPrefix(msg, fileFramePrefix) {
-		fmt.Printf("[%s] [%s] <binary data: %d bytes>\n", timestamp, from, len(data))
-		return
-	}
 
-	// Split header and payload at the first newline: "FILE:<filename>|<size>|<checksum>\n<raw>"
-	idx := strings.Index(msg, "\n")
-	if idx <= 0 {
-		fmt.Printf("[%s] [ERROR] Invalid file frame header from %s\n", timestamp, from)
-		return
-	}
-	header := msg[:idx]
-	if !strings.HasPrefix(header, fileFramePrefix) {
-		fmt.Printf("[%s] [ERROR] Invalid file frame prefix from %s\n", timestamp, from)
-		return
-	}
-	meta := strings.TrimPrefix(header, fileFramePrefix)
-	fields := strings.SplitN(meta, "|", 3)
-	if len(fields) != 3 {
-		fmt.Printf("[%s] [ERROR] Invalid metadata in file frame from %s\n", timestamp, from)
-		return
-	}
-	fileName := fields[0]
-	sizeStr := fields[1]
-	want := strings.ToLower(fields[2])
-	raw := data[idx+1:]
-
-	// raw bytes follow the header
-
-	// Verify checksum
-	sum := sha256.Sum256(raw)
-	got := strings.ToLower(hex.EncodeToString(sum[:]))
-	if got != want {
-		fmt.Printf("[%s] [ERROR] Checksum mismatch for %s from %s (got %s, want %s)\n", timestamp, fileName, from, got, want)
-		return
-	}
-
-	// Verify size (best-effort)
-	if n, err := strconv.Atoi(sizeStr); err == nil && n != len(raw) {
-		fmt.Printf("[%s] [WARN] Size mismatch for %s from %s (got %d, expect %d)\n", timestamp, fileName, from, len(raw), n)
-	}
-
-	// Save file
-	if err := os.MkdirAll("downloads", 0o755); err != nil {
-		fmt.Printf("[%s] [ERROR] Cannot create downloads directory: %v\n", timestamp, err)
-		return
-	}
-	outPath := filepath.Join("downloads", fileName)
-	// Avoid overwriting by finding next available name
-	finalPath := outPath
-	for i := 1; i < 10000; i++ {
-		if _, err := os.Stat(finalPath); os.IsNotExist(err) {
-			break
+	// START frame
+	if strings.HasPrefix(msg, fileStartPrefix) {
+		meta := strings.TrimPrefix(msg, fileStartPrefix)
+		if i := strings.Index(meta, "\n"); i >= 0 {
+			meta = meta[:i]
 		}
-		ext := filepath.Ext(fileName)
-		base := strings.TrimSuffix(fileName, ext)
-		finalPath = filepath.Join("downloads", fmt.Sprintf("%s-(%d)%s", base, i, ext))
-	}
+		fields := strings.SplitN(meta, "|", 3)
+		if len(fields) != 3 {
+			fmt.Printf("[%s] [ERROR] Invalid FILESTART metadata from %s\n", timestamp, from)
+			return
+		}
 
-	if err := os.WriteFile(finalPath, raw, 0o644); err != nil {
-		fmt.Printf("[%s] [ERROR] Cannot write file %s: %v\n", timestamp, finalPath, err)
+		fileName := fields[0]
+		size, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil {
+			fmt.Printf("[%s] [ERROR] Invalid file size in FILESTART from %s\n", timestamp, from)
+			return
+		}
+		want := strings.ToLower(fields[2])
+
+		if err := os.MkdirAll("downloads", 0o755); err != nil {
+			fmt.Printf("[%s] [ERROR] Cannot create downloads directory: %v\n", timestamp, err)
+			return
+		}
+		outPath := filepath.Join("downloads", fileName)
+		finalPath := outPath
+		for i := 1; i < 10000; i++ {
+			if _, err := os.Stat(finalPath); os.IsNotExist(err) {
+				break
+			}
+			ext := filepath.Ext(fileName)
+			base := strings.TrimSuffix(fileName, ext)
+			finalPath = filepath.Join("downloads", fmt.Sprintf("%s-(%d)%s", base, i, ext))
+		}
+		tmpPath := finalPath + ".part"
+
+		f, err := os.Create(tmpPath)
+		if err != nil {
+			fmt.Printf("[%s] [ERROR] Cannot open temp file %s: %v\n", timestamp, tmpPath, err)
+			return
+		}
+
+		key := peerID + "|" + fileName
+		recvFiles[key] = &incomingFile{
+			fileName:         fileName,
+			tmpPath:          tmpPath,
+			finalPath:        finalPath,
+			f:                f,
+			hasher:           sha256.New(),
+			expectedSize:     size,
+			expectedChecksum: want,
+			received:         0,
+		}
+
+		fmt.Printf("[%s] [FILE] %s is sending %s (%d bytes)\n", timestamp, from, fileName, size)
 		return
 	}
 
-	fmt.Printf("[%s] [FILE] %s sent file: %s (%d bytes) -> %s\n", timestamp, from, fileName, len(raw), finalPath)
+	// CHUNK frame
+	if strings.HasPrefix(msg, fileChunkPrefix) {
+		i := strings.Index(msg, "\n")
+		if i <= 0 {
+			fmt.Printf("[%s] [ERROR] Invalid FILECHUNK header from %s\n", timestamp, from)
+			return
+		}
+		header := msg[:i]
+		fileName := strings.TrimPrefix(header, fileChunkPrefix)
+		raw := data[i+1:]
+
+		key := peerID + "|" + fileName
+		st, ok := recvFiles[key]
+		if !ok || st.f == nil {
+			fmt.Printf("[%s] [ERROR] Unexpected FILECHUNK for %s from %s (no FILESTART)\n", timestamp, fileName, from)
+			return
+		}
+
+		if _, err := st.f.Write(raw); err != nil {
+			fmt.Printf("[%s] [ERROR] Write error for %s: %v\n", timestamp, st.tmpPath, err)
+			st.f.Close()
+			os.Remove(st.tmpPath)
+			delete(recvFiles, key)
+			return
+		}
+		if _, err := st.hasher.Write(raw); err != nil {
+			fmt.Printf("[%s] [ERROR] Hash update error for %s: %v\n", timestamp, st.tmpPath, err)
+			st.f.Close()
+			os.Remove(st.tmpPath)
+			delete(recvFiles, key)
+			return
+		}
+		st.received += int64(len(raw))
+
+		if st.expectedSize > 0 {
+			percent := float64(st.received) * 100.0 / float64(st.expectedSize)
+			fmt.Printf("[%s] [FILE] %s progress: %.1f%% (%d/%d bytes)\n", timestamp, st.fileName, percent, st.received, st.expectedSize)
+		}
+		return
+	}
+
+	// END frame
+	if strings.HasPrefix(msg, fileEndPrefix) {
+		meta := strings.TrimPrefix(msg, fileEndPrefix)
+		if i := strings.Index(meta, "\n"); i >= 0 {
+			meta = meta[:i]
+		}
+		parts := strings.SplitN(meta, "|", 2)
+		fileName := parts[0]
+		want := ""
+		if len(parts) == 2 {
+			want = strings.ToLower(parts[1])
+		}
+
+		key := peerID + "|" + fileName
+		st, ok := recvFiles[key]
+		if !ok || st.f == nil {
+			fmt.Printf("[%s] [ERROR] Unexpected FILEEND for %s from %s\n", timestamp, fileName, from)
+			return
+		}
+
+		st.f.Close()
+		got := strings.ToLower(hex.EncodeToString(st.hasher.Sum(nil)))
+
+		if st.expectedSize > 0 && st.received != st.expectedSize {
+			fmt.Printf("[%s] [WARN] Size mismatch for %s from %s (got %d, expect %d)\n", timestamp, fileName, from, st.received, st.expectedSize)
+		}
+
+		if got != st.expectedChecksum || (want != "" && got != want) {
+			fmt.Printf("[%s] [ERROR] Checksum mismatch for %s from %s (got %s, want %s)\n", timestamp, fileName, from, got, st.expectedChecksum)
+			os.Remove(st.tmpPath)
+			delete(recvFiles, key)
+			return
+		}
+
+		if err := os.Rename(st.tmpPath, st.finalPath); err != nil {
+			fmt.Printf("[%s] [ERROR] Cannot finalize file %s: %v\n", timestamp, st.finalPath, err)
+			os.Remove(st.tmpPath)
+			delete(recvFiles, key)
+			return
+		}
+
+		fmt.Printf("[%s] [FILE] %s sent file: %s (%d bytes) -> %s\n", timestamp, from, fileName, st.received, st.finalPath)
+		delete(recvFiles, key)
+		return
+	}
+
+	// Not a file frame
+	fmt.Printf("[%s] [%s] <binary data: %d bytes>\n", timestamp, from, len(data))
 }
 
 // Handle P2P messages with professional formatting
@@ -149,7 +301,8 @@ func handleP2PMessages(node *p2p.P2PNode) {
 		case p2p.MsgBytesMessage:
 			data := msg.Data["data"].([]byte)
 			from := msg.Data["from"].(string)
-			handleIncomingBytes(from, data, timestamp)
+			peerID := msg.Data["peerID"].(string)
+			handleIncomingBytes(peerID, from, data, timestamp)
 
 		case p2p.MsgBootstrapSuccess:
 			fmt.Printf("[%s] [BOOTSTRAP] Connected to seed node %s\n",
